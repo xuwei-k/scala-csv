@@ -21,10 +21,13 @@ object CSVParser {
   case object Start extends State
   case object Field extends State
   case object Delimiter extends State
-  case object End extends State
   case object QuoteStart extends State
   case object QuoteEnd extends State
   case object QuotedField extends State
+
+  private[this] sealed abstract class Result
+  private[this] final case class AtEnd(fields: Vector[String]) extends Result
+  private[this] final case class NoEnd(fields: Vector[String], state: State, field: StringBuilder) extends Result
 
   /**
    * {{{
@@ -36,223 +39,142 @@ object CSVParser {
    * }}}
    */
   def parse(input: String, escapeChar: Char, delimiter: Char, quoteChar: Char): Option[List[String]] = {
-    var buf: Array[Char] = input.toCharArray
-    var fields: Vector[String] = Vector()
-    var field = new StringBuilder
-    var state: State = Start
-    var pos = 0
+    val buf: Array[Char] = input.toCharArray
     val buflen = buf.length
 
-    while (state != End && pos < buflen) {
-      val c = buf(pos)
-      state match {
-        case Start => {
-          c match {
-            case `quoteChar` => {
-              state = QuoteStart
-              pos += 1
-            }
-            case `delimiter` => {
-              fields :+= field.toString
-              field = new StringBuilder
-              state = Delimiter
-              pos += 1
-            }
-            case '\n' | '\u2028' | '\u2029' | '\u0085' => {
-              fields :+= field.toString
-              field = new StringBuilder
-              state = End
-              pos += 1
-            }
-            case '\r' => {
-              if (pos + 1 < buflen && buf(1) == '\n') {
-                pos += 1
+    @annotation.tailrec
+    def loop(state: State, pos: Int, fields: Vector[String], field: StringBuilder): Result = {
+      if (pos < buflen) {
+        val c = buf(pos)
+        state match {
+          case Start => {
+            c match {
+              case `quoteChar` => {
+                loop(QuoteStart, pos + 1, fields, field)
               }
-              fields :+= field.toString
-              field = new StringBuilder
-              state = End
-              pos += 1
-            }
-            case x => {
-              field += x
-              state = Field
-              pos += 1
+              case `delimiter` => {
+                loop(Delimiter, pos + 1, fields :+ field.toString, new StringBuilder)
+              }
+              case '\n' | '\u2028' | '\u2029' | '\u0085' | '\r' => {
+                AtEnd(fields :+ field.toString)
+              }
+              case x => {
+                loop(Field, pos + 1, fields, field += x)
+              }
             }
           }
-        }
-        case Delimiter => {
-          c match {
-            case `quoteChar` => {
-              state = QuoteStart
-              pos += 1
-            }
-            case `delimiter` => {
-              fields :+= field.toString
-              field = new StringBuilder
-              state = Delimiter
-              pos += 1
-            }
-            case '\n' | '\u2028' | '\u2029' | '\u0085' => {
-              fields :+= field.toString
-              field = new StringBuilder
-              state = End
-              pos += 1
-            }
-            case '\r' => {
-              if (pos + 1 < buflen && buf(1) == '\n') {
-                pos += 1
+          case Delimiter => {
+            c match {
+              case `quoteChar` => {
+                loop(QuoteStart, pos + 1, fields, field)
               }
-              fields :+= field.toString
-              field = new StringBuilder
-              state = End
-              pos += 1
-            }
-            case x => {
-              field += x
-              state = Field
-              pos += 1
+              case `delimiter` => {
+                loop(Delimiter, pos + 1, fields :+ field.toString, new StringBuilder)
+              }
+              case '\n' | '\u2028' | '\u2029' | '\u0085' | '\r' => {
+                AtEnd(fields :+ field.toString)
+              }
+              case x => {
+                loop(Field, pos + 1, fields, field += x)
+              }
             }
           }
-        }
-        case Field => {
-          c match {
-            case `escapeChar` => {
-              if (pos + 1 < buflen) {
-                if (buf(pos + 1) == escapeChar
-                  || buf(pos + 1) == delimiter) {
-                  field += buf(pos + 1)
-                  state = Field
-                  pos += 2
+          case Field => {
+            c match {
+              case `escapeChar` => {
+                if (pos + 1 < buflen) {
+                  if (buf(pos + 1) == escapeChar
+                    || buf(pos + 1) == delimiter) {
+                    loop(Field, pos + 2, fields, field += buf(pos + 1))
+                  } else {
+                    throw new MalformedCSVException(input)
+                  }
                 } else {
-                  throw new MalformedCSVException(buf.mkString)
+                  loop(QuoteEnd, pos + 1, fields, field)
                 }
-              } else {
-                state = QuoteEnd
-                pos += 1
+              }
+              case `delimiter` => {
+                loop(Delimiter, pos + 1, fields :+ field.toString, new StringBuilder)
+              }
+              case '\n' | '\u2028' | '\u2029' | '\u0085' | '\r' => {
+                AtEnd(fields :+ field.toString)
+              }
+              case x => {
+                loop(Field, pos + 1, fields, field += x)
               }
             }
-            case `delimiter` => {
-              fields :+= field.toString
-              field = new StringBuilder
-              state = Delimiter
-              pos += 1
-            }
-            case '\n' | '\u2028' | '\u2029' | '\u0085' => {
-              fields :+= field.toString
-              field = new StringBuilder
-              state = End
-              pos += 1
-            }
-            case '\r' => {
-              if (pos + 1 < buflen && buf(1) == '\n') {
-                pos += 1
+          }
+          case QuoteStart => {
+            c match {
+              case `quoteChar` => {
+                if (pos + 1 < buflen && buf(pos + 1) == quoteChar) {
+                  loop(QuotedField, pos + 2, fields, field += quoteChar)
+                } else {
+                  loop(QuoteEnd, pos + 1, fields :+ field.toString, new StringBuilder)
+                }
               }
-              fields :+= field.toString
-              field = new StringBuilder
-              state = End
-              pos += 1
+              case x => {
+                loop(QuotedField, pos + 1, fields, field + x)
+              }
             }
-            case x => {
-              field += x
-              state = Field
-              pos += 1
+          }
+          case QuoteEnd => {
+            c match {
+              case `delimiter` => {
+                loop(Delimiter, pos + 1, fields :+ field.toString, new StringBuilder)
+              }
+              case '\n' | '\u2028' | '\u2029' | '\u0085' | '\r' => {
+                AtEnd(fields :+ field.toString)
+              }
+              case _ => {
+                throw new MalformedCSVException(input)
+              }
+            }
+          }
+          case QuotedField => {
+            c match {
+              case `quoteChar` => {
+                if (pos + 1 < buflen && buf(pos + 1) == quoteChar) {
+                  loop(QuotedField, pos + 2, fields, field += quoteChar)
+                } else {
+                  loop(QuoteEnd, pos + 1, fields, field)
+                }
+              }
+              case x => {
+                loop(QuotedField, pos + 1, fields, field + x)
+              }
             }
           }
         }
-        case QuoteStart => {
-          c match {
-            case `quoteChar` => {
-              if (pos + 1 < buflen && buf(pos + 1) == quoteChar) {
-                field += quoteChar
-                state = QuotedField
-                pos += 2
-              } else {
-                fields :+= field.toString
-                field = new StringBuilder
-                state = QuoteEnd
-                pos += 1
-              }
-            }
-            case x => {
-              field += x
-              state = QuotedField
-              pos += 1
-            }
-          }
-        }
-        case QuoteEnd => {
-          c match {
-            case `delimiter` => {
-              fields :+= field.toString
-              field = new StringBuilder
-              state = Delimiter
-              pos += 1
-            }
-            case '\n' | '\u2028' | '\u2029' | '\u0085' => {
-              fields :+= field.toString
-              field = new StringBuilder
-              state = End
-              pos += 1
-            }
-            case '\r' => {
-              if (pos + 1 < buflen && buf(1) == '\n') {
-                pos += 1
-              }
-              fields :+= field.toString
-              field = new StringBuilder
-              state = End
-              pos += 1
-            }
-            case _ => {
-              throw new MalformedCSVException(buf.mkString)
-            }
-          }
-        }
-        case QuotedField => {
-          c match {
-            case `quoteChar` => {
-              if (pos + 1 < buflen && buf(pos + 1) == quoteChar) {
-                field += quoteChar
-                state = QuotedField
-                pos += 2
-              } else {
-                state = QuoteEnd
-                pos += 1
-              }
-            }
-            case x => {
-              field += x
-              state = QuotedField
-              pos += 1
-            }
-          }
-        }
-        case End => {
-          sys.error("unexpected error")
-        }
+      } else {
+        NoEnd(fields, state, field)
       }
     }
-    state match {
-      case Delimiter => {
-        fields :+= ""
-        Some(fields.toList)
+
+    loop(Start, 0, Vector.empty[String], new StringBuilder) match {
+      case NoEnd(fields, Delimiter, _) => {
+        Some((fields :+ "").toList)
       }
-      case QuotedField => {
+      case NoEnd(_, QuotedField, _) => {
         None
       }
-      case _ => {
-        if (!field.isEmpty) {
+      case NoEnd(fields, state, field) => {
+        if (field.nonEmpty) {
           // When no crlf at end of file
           state match {
             case Field | QuoteEnd => {
-              fields :+= field.toString
+              Some((fields :+ field.toString).toList)
             }
             case _ => {
+              Some(fields.toList)
             }
           }
+        } else {
+          Some(fields.toList)
         }
-        Some(fields.toList)
       }
+      case AtEnd(fields) =>
+        Some(fields.toList)
     }
   }
 }
